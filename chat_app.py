@@ -34,10 +34,14 @@ from pydantic_ai.messages import (
 
 load_dotenv()
 
-openai.api_key = os.getenv('OPENAI_API_KEY')
 # 'if-token-present' means nothing will be sent (and the example will work) if you don't have logfire configured
 logfire.configure(send_to_logfire='if-token-present')
 logfire.instrument_pydantic_ai()
+
+# Initialize the agent with environment variable
+openai_api_key = os.getenv('OPENAI_API_KEY')
+if not openai_api_key:
+    raise ValueError("OPENAI_API_KEY environment variable is not set")
 
 agent = Agent('openai:gpt-4o')
 THIS_DIR = Path(__file__).parent
@@ -47,36 +51,40 @@ DB_PATH = Path('/tmp/chat_app_messages.sqlite') if os.getenv('VERCEL') else THIS
 
 @asynccontextmanager
 async def lifespan(_app: fastapi.FastAPI):
-    async with Database.connect() as db:
-        yield {'db': db}
+    try:
+        async with Database.connect() as db:
+            yield {'db': db}
+    except Exception as e:
+        print(f"Database connection error: {e}")
+        yield {'db': None}
 
 app = fastapi.FastAPI(lifespan=lifespan)
 logfire.instrument_fastapi(app)
 
-
 @app.get('/')
 async def index() -> FileResponse:
-    return FileResponse((Path(__file__).parent / 'chat_app.html'), media_type='text/html')
-
+    return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
 
 @app.get('/chat_app.ts')
 async def main_ts() -> FileResponse:
-    """Get the raw typescript code, it's compiled in the browser, forgive me."""
-    return FileResponse((Path(__file__).parent / 'chat_app.ts'), media_type='text/plain')
-
+    return FileResponse((THIS_DIR / 'chat_app.ts'), media_type='text/plain')
 
 async def get_db(request: Request) -> Database:
-    return request.state.db
-
+    db = request.state.db
+    if db is None:
+        raise fastapi.HTTPException(status_code=500, detail="Database connection failed")
+    return db
 
 @app.get('/chat/')
 async def get_chat(database: Database = Depends(get_db)) -> Response:
-    msgs = await database.get_messages()
-    return Response(
-        b'\n'.join(json.dumps(to_chat_message(m)).encode('utf-8') for m in msgs),
-        media_type='text/plain',
-    )
-
+    try:
+        msgs = await database.get_messages()
+        return Response(
+            b'\n'.join(json.dumps(to_chat_message(m)).encode('utf-8') for m in msgs),
+            media_type='text/plain',
+        )
+    except Exception as e:
+        raise fastapi.HTTPException(status_code=500, detail=str(e))
 
 class ChatMessage(TypedDict):
     """Format of messages sent to the browser."""
@@ -110,33 +118,28 @@ def to_chat_message(m: ModelMessage) -> ChatMessage:
 async def post_chat(
     prompt: Annotated[str, fastapi.Form()], database: Database = Depends(get_db)
 ) -> StreamingResponse:
-    async def stream_messages():
-        """Streams new line delimited JSON `Message`s to the client."""
-        # stream the user prompt so that can be displayed straight away
-        yield (
-            json.dumps(
-                {
-                    'role': 'user',
-                    'timestamp': datetime.now(tz=timezone.utc).isoformat(),
-                    'content': prompt,
-                }
-            ).encode('utf-8')
-            + b'\n'
-        )
-        # get the chat history so far to pass as context to the agent
-        messages = await database.get_messages()
-        # run the agent with the user prompt and the chat history
-        async with agent.run_stream(prompt, message_history=messages) as result:
-            async for text in result.stream(debounce_by=0.01):
-                # text here is a `str` and the frontend wants
-                # JSON encoded ModelResponse, so we create one
-                m = ModelResponse(parts=[TextPart(text)], timestamp=result.timestamp())
-                yield json.dumps(to_chat_message(m)).encode('utf-8') + b'\n'
+    try:
+        async def stream_messages():
+            yield (
+                json.dumps(
+                    {
+                        'role': 'user',
+                        'timestamp': datetime.now(tz=timezone.utc).isoformat(),
+                        'content': prompt,
+                    }
+                ).encode('utf-8')
+                + b'\n'
+            )
+            messages = await database.get_messages()
+            async with agent.run_stream(prompt, message_history=messages) as result:
+                async for text in result.stream(debounce_by=0.01):
+                    m = ModelResponse(parts=[TextPart(text)], timestamp=result.timestamp())
+                    yield json.dumps(to_chat_message(m)).encode('utf-8') + b'\n'
+            await database.add_messages(result.new_messages_json())
 
-        # add new messages (e.g. the user prompt and the agent response in this case) to the database
-        await database.add_messages(result.new_messages_json())
-
-    return StreamingResponse(stream_messages(), media_type='text/plain')
+        return StreamingResponse(stream_messages(), media_type='text/plain')
+    except Exception as e:
+        raise fastapi.HTTPException(status_code=500, detail=str(e))
 
 
 P = ParamSpec('P')

@@ -40,9 +40,10 @@ logfire.configure(send_to_logfire='if-token-present')
 logfire.instrument_pydantic_ai()
 
 agent = Agent('openai:gpt-4o')
+THIS_DIR = Path(__file__).parent
 
 # For Vercel deployment, we'll use an in-memory SQLite database
-DB_PATH = Path('/tmp/chat_app_messages.sqlite') if os.getenv('VERCEL') else Path(__file__).parent / '.chat_app_messages.sqlite'
+DB_PATH = Path('/tmp/chat_app_messages.sqlite') if os.getenv('VERCEL') else THIS_DIR / '.chat_app_messages.sqlite'
 
 @asynccontextmanager
 async def lifespan(_app: fastapi.FastAPI):

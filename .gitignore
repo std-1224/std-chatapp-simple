@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .chat_app_messages.sqlite
 .vercel 
+.vercel

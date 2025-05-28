@@ -15,13 +15,17 @@ from typing import Annotated, Any, Callable, Literal, TypeVar
 
 import fastapi
 import logfire
-from fastapi import Depends, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi import Depends, Request, FastAPI, HTTPException
+from fastapi.responses import FileResponse, Response, StreamingResponse, HTMLResponse
 from typing_extensions import LiteralString, ParamSpec, TypedDict
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import openai
+import logging
 
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
-import pydantic_ai.models.openai as openai
+import pydantic_ai.models.openai as openai_pydantic
 from dotenv import load_dotenv
 from pydantic_ai.messages import (
     ModelMessage,
@@ -49,8 +53,12 @@ THIS_DIR = Path(__file__).parent
 # For Vercel deployment, we'll use an in-memory SQLite database
 DB_PATH = Path('/tmp/chat_app_messages.sqlite') if os.getenv('VERCEL') else THIS_DIR / '.chat_app_messages.sqlite'
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 @asynccontextmanager
-async def lifespan(_app: fastapi.FastAPI):
+async def lifespan(_app: FastAPI):
     try:
         async with Database.connect() as db:
             yield {'db': db}
@@ -58,12 +66,32 @@ async def lifespan(_app: fastapi.FastAPI):
         print(f"Database connection error: {e}")
         yield {'db': None}
 
-app = fastapi.FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 logfire.instrument_fastapi(app)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load OpenAI API key from environment variable
+openai.api_key = os.getenv("OPENAI_API_KEY")
+if not openai.api_key:
+    logger.error("OPENAI_API_KEY environment variable is not set!")
+    raise ValueError("OPENAI_API_KEY environment variable is not set!")
 
 @app.get('/')
 async def index() -> FileResponse:
-    return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
+    logger.info("Serving chat_app.html")
+    try:
+        return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
+    except Exception as e:
+        logger.error(f"Error reading chat_app.html: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get('/chat_app.ts')
 async def main_ts() -> FileResponse:
@@ -218,3 +246,33 @@ class Database:
             partial(func, **kwargs),
             *args,  # type: ignore
         )
+
+class ChatRequest(BaseModel):
+    message: str
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    logger.info(f"Received chat request: {request.message}")
+    try:
+        if not request.message:
+            logger.error("Empty message received")
+            raise HTTPException(status_code=400, detail="Message cannot be empty")
+            
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": request.message}
+            ]
+        )
+        
+        logger.info("Successfully got response from OpenAI")
+        return {"response": response.choices[0].message.content}
+    except Exception as e:
+        logger.error(f"Error in chat endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    logger.info("Starting FastAPI server...")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
